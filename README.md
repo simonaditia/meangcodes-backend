@@ -4,6 +4,8 @@
 
 1. Salin `.env.example` menjadi `.env`.
 2. Isi `ADMIN_EMAIL`, `ADMIN_PASSWORD`, dan `JWT_SECRET`.
+3. Jika ingin pakai Supabase Postgres, isi `DATABASE_URL` dengan connection string Supabase atau `SUPABASE_DATABASE_URL`.
+4. Jika ingin upload gambar ke Supabase Storage, set `SUPABASE_STORAGE_ENABLED=true` lalu isi `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, dan `SUPABASE_STORAGE_BUCKET`.
 3. Saat startup, backend akan memastikan akun admin ada di tabel `users` (password disimpan sebagai `password_hash` bcrypt).
 2. Pastikan PostgreSQL aktif dan database tersedia.
 3. Jalankan:
@@ -21,6 +23,7 @@ Server default berjalan di `http://localhost:8080`.
 
 ## Endpoint utama
 
+- `GET /health` -> health check service + koneksi database
 - `GET /api/articles` -> daftar artikel terbaru (maks 12)
 - `GET /api/articles/:slug` -> detail artikel berdasarkan slug
 
@@ -36,6 +39,11 @@ Server default berjalan di `http://localhost:8080`.
 - `DELETE /api/articles/:slug` (soft delete via `deleted_at`)
 - `POST /api/uploads`
 - `DELETE /api/uploads`
+
+## Rate limit endpoint sensitif
+
+- `POST /api/auth/login` diberi rate limit berbasis IP
+- `POST /api/uploads` dan `DELETE /api/uploads` diberi rate limit berbasis IP
 
 ## CORS development
 

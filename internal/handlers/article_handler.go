@@ -1,11 +1,13 @@
 package handlers
 
 import (
+	"bytes"
 	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"meangcodes/backend/internal/models"
+	"meangcodes/backend/internal/storage"
 	"net/http"
 	"net/url"
 	"os"
@@ -47,13 +49,14 @@ type deleteImageRequest struct {
 }
 
 type ArticleHandler struct {
-	DB *gorm.DB
+	DB           *gorm.DB
+	SupabaseStore *storage.SupabaseStorage
 }
 
 const maxUploadSize = 5 << 20 // 5MB
 
-func NewArticleHandler(db *gorm.DB) *ArticleHandler {
-	return &ArticleHandler{DB: db}
+func NewArticleHandler(db *gorm.DB, supabaseStore *storage.SupabaseStorage) *ArticleHandler {
+	return &ArticleHandler{DB: db, SupabaseStore: supabaseStore}
 }
 
 func (h *ArticleHandler) GetLatestArticles(c *gin.Context) {
@@ -401,6 +404,36 @@ func (h *ArticleHandler) UploadImage(c *gin.Context) {
 		return
 	}
 
+	if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to rewind uploaded file"})
+		return
+	}
+
+	if h.SupabaseStore != nil {
+		storedName := fmt.Sprintf("%d-%s%s", time.Now().UnixNano(), randomToken(6), ext)
+		objectKey := storage.BuildObjectKey("articles", storedName)
+
+		buffer := bytes.NewBuffer(nil)
+		if _, err := io.Copy(buffer, file); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read uploaded image"})
+			return
+		}
+
+		publicURL, err := h.SupabaseStore.UploadObject(c.Request.Context(), objectKey, bytes.NewReader(buffer.Bytes()), contentType)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upload image to supabase storage"})
+			return
+		}
+
+		c.JSON(http.StatusCreated, gin.H{
+			"data": gin.H{
+				"url":  publicURL,
+				"path": publicURL,
+			},
+		})
+		return
+	}
+
 	if err := os.MkdirAll("uploads", 0o755); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare upload directory"})
 		return
@@ -438,6 +471,18 @@ func (h *ArticleHandler) DeleteImage(c *gin.Context) {
 	}
 
 	if !isUploadPath(path) {
+		if h.SupabaseStore != nil {
+			if objectKey, ok := h.SupabaseStore.ObjectKeyFromInput(firstNonEmpty(strings.TrimSpace(req.Path), strings.TrimSpace(req.URL))); ok {
+				if err := h.SupabaseStore.DeleteObject(c.Request.Context(), objectKey); err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "failed to delete supabase image"})
+					return
+				}
+
+				c.JSON(http.StatusOK, gin.H{"message": "image deleted", "path": objectKey})
+				return
+			}
+		}
+
 		c.JSON(http.StatusBadRequest, gin.H{"error": "only uploaded images can be deleted"})
 		return
 	}
