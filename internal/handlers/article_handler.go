@@ -123,6 +123,308 @@ func (h *ArticleHandler) GetLatestArticles(c *gin.Context) {
 	})
 }
 
+func (h *ArticleHandler) GetTrendingArticles(c *gin.Context) {
+	limit := parsePositiveInt(c.Query("limit"), 6)
+	if limit > 20 {
+		limit = 20
+	}
+
+	periodDays := parsePositiveInt(c.Query("days"), 30)
+	if periodDays > 365 {
+		periodDays = 365
+	}
+
+	since := time.Now().AddDate(0, 0, -periodDays)
+
+	var articles []models.Article
+	err := h.DB.
+		Preload("Author").
+		Preload("Category").
+		Where("published = ? AND created_at >= ?", true, since).
+		Order("views DESC").
+		Order("created_at DESC").
+		Limit(limit).
+		Find(&articles).Error
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch trending articles"})
+		return
+	}
+
+	if len(articles) == 0 {
+		err = h.DB.
+			Preload("Author").
+			Preload("Category").
+			Where("published = ?", true).
+			Order("views DESC").
+			Order("created_at DESC").
+			Limit(limit).
+			Find(&articles).Error
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch trending fallback"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": articles,
+		"meta": gin.H{
+			"windowDays": periodDays,
+			"limit":      limit,
+		},
+	})
+}
+
+func (h *ArticleHandler) GetLatestArticlesByCategory(c *gin.Context) {
+	categorySlug := strings.ToLower(strings.TrimSpace(c.Param("slug")))
+	if categorySlug == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "category slug is required"})
+		return
+	}
+
+	var category models.Category
+	if err := h.DB.Where("slug = ?", categorySlug).First(&category).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "category not found"})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch category"})
+		return
+	}
+
+	page := parsePositiveInt(c.Query("page"), 1)
+	pageSize := parsePositiveInt(c.Query("limit"), 9)
+	if pageSize > 50 {
+		pageSize = 50
+	}
+
+	search := strings.TrimSpace(c.Query("search"))
+
+	var articles []models.Article
+	query := h.DB.Model(&models.Article{}).
+		Where("published = ? AND category_id = ?", true, category.ID)
+
+	if search != "" {
+		likeTerm := "%" + strings.ToLower(search) + "%"
+		query = query.Where("LOWER(title) LIKE ? OR LOWER(content) LIKE ?", likeTerm, likeTerm)
+	}
+
+	var totalItems int64
+	if err := query.Count(&totalItems).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to count category articles"})
+		return
+	}
+
+	offset := (page - 1) * pageSize
+	totalPages := int((totalItems + int64(pageSize) - 1) / int64(pageSize))
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	if page > totalPages {
+		page = totalPages
+		offset = (page - 1) * pageSize
+	}
+
+	if err := query.
+		Preload("Author").
+		Preload("Category").
+		Order("created_at DESC").
+		Limit(pageSize).
+		Offset(offset).
+		Find(&articles).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch category articles"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": articles,
+		"category": gin.H{
+			"id":   category.ID,
+			"name": category.Name,
+			"slug": category.Slug,
+		},
+		"pagination": gin.H{
+			"page":       page,
+			"limit":      pageSize,
+			"totalItems": totalItems,
+			"totalPages": totalPages,
+			"hasNext":    page < totalPages,
+			"hasPrev":    page > 1,
+		},
+	})
+}
+
+func (h *ArticleHandler) GetHomepageBundle(c *gin.Context) {
+	page := parsePositiveInt(c.Query("page"), 1)
+	pageSize := parsePositiveInt(c.Query("limit"), 9)
+	if pageSize > 50 {
+		pageSize = 50
+	}
+
+	search := strings.TrimSpace(c.Query("search"))
+	categorySlug := strings.TrimSpace(c.Query("category"))
+
+	trendingLimit := parsePositiveInt(c.Query("trendingLimit"), 7)
+	if trendingLimit > 20 {
+		trendingLimit = 20
+	}
+
+	trendingDays := parsePositiveInt(c.Query("trendingDays"), 45)
+	if trendingDays > 365 {
+		trendingDays = 365
+	}
+
+	sectionCategoryLimit := parsePositiveInt(c.Query("sectionCategoryLimit"), 3)
+	if sectionCategoryLimit > 8 {
+		sectionCategoryLimit = 8
+	}
+
+	sectionArticleLimit := parsePositiveInt(c.Query("sectionArticleLimit"), 3)
+	if sectionArticleLimit > 8 {
+		sectionArticleLimit = 8
+	}
+
+	baseQuery := h.DB.Model(&models.Article{}).
+		Joins("LEFT JOIN categories ON categories.id = articles.category_id").
+		Where("articles.published = ?", true)
+
+	if search != "" {
+		likeTerm := "%" + strings.ToLower(search) + "%"
+		baseQuery = baseQuery.Where("LOWER(articles.title) LIKE ? OR LOWER(articles.content) LIKE ?", likeTerm, likeTerm)
+	}
+
+	if categorySlug != "" {
+		baseQuery = baseQuery.Where("categories.slug = ?", strings.ToLower(categorySlug))
+	}
+
+	var totalItems int64
+	if err := baseQuery.Count(&totalItems).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to count homepage latest articles"})
+		return
+	}
+
+	offset := (page - 1) * pageSize
+	totalPages := int((totalItems + int64(pageSize) - 1) / int64(pageSize))
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	if page > totalPages {
+		page = totalPages
+		offset = (page - 1) * pageSize
+	}
+
+	var latest []models.Article
+	if err := baseQuery.
+		Preload("Author").
+		Preload("Category").
+		Order("articles.created_at DESC").
+		Limit(pageSize).
+		Offset(offset).
+		Find(&latest).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch homepage latest articles"})
+		return
+	}
+
+	var categories []models.Category
+	if err := h.DB.Order("name ASC").Find(&categories).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch homepage categories"})
+		return
+	}
+
+	trendingSince := time.Now().AddDate(0, 0, -trendingDays)
+	var trending []models.Article
+	err := h.DB.
+		Preload("Author").
+		Preload("Category").
+		Where("published = ? AND created_at >= ?", true, trendingSince).
+		Order("views DESC").
+		Order("created_at DESC").
+		Limit(trendingLimit).
+		Find(&trending).Error
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch homepage trending articles"})
+		return
+	}
+
+	if len(trending) == 0 {
+		err = h.DB.
+			Preload("Author").
+			Preload("Category").
+			Where("published = ?", true).
+			Order("views DESC").
+			Order("created_at DESC").
+			Limit(trendingLimit).
+			Find(&trending).Error
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch homepage trending fallback"})
+			return
+		}
+	}
+
+	type homepageSection struct {
+		Category models.Category  `json:"category"`
+		Articles []models.Article `json:"articles"`
+	}
+
+	sections := make([]homepageSection, 0)
+	for _, category := range categories {
+		if len(sections) >= sectionCategoryLimit {
+			break
+		}
+
+		var sectionArticles []models.Article
+		if err := h.DB.
+			Preload("Author").
+			Preload("Category").
+			Where("published = ? AND category_id = ?", true, category.ID).
+			Order("created_at DESC").
+			Limit(sectionArticleLimit).
+			Find(&sectionArticles).Error; err != nil {
+			continue
+		}
+
+		if len(sectionArticles) == 0 {
+			continue
+		}
+
+		sections = append(sections, homepageSection{
+			Category: category,
+			Articles: sectionArticles,
+		})
+	}
+
+	var featured *models.Article
+	if len(trending) > 0 {
+		featured = &trending[0]
+	} else if len(latest) > 0 {
+		featured = &latest[0]
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": gin.H{
+			"featured":  featured,
+			"latest":    latest,
+			"trending":  trending,
+			"categories": categories,
+			"sections":  sections,
+			"pagination": gin.H{
+				"page":       page,
+				"limit":      pageSize,
+				"totalItems": totalItems,
+				"totalPages": totalPages,
+				"hasNext":    page < totalPages,
+				"hasPrev":    page > 1,
+			},
+		},
+		"meta": gin.H{
+			"trendingWindowDays": trendingDays,
+			"trendingLimit":      trendingLimit,
+			"sectionCategoryLimit": sectionCategoryLimit,
+			"sectionArticleLimit":  sectionArticleLimit,
+		},
+	})
+}
+
 func (h *ArticleHandler) GetArticleBySlug(c *gin.Context) {
 	slug := c.Param("slug")
 	var article models.Article

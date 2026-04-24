@@ -26,8 +26,12 @@ func RegisterRoutes(router *gin.Engine, authConfig auth.Config, articleHandler *
 		}
 
 		api.GET("/articles", articleHandler.GetLatestArticles)
+		api.GET("/homepage", articleHandler.GetHomepageBundle)
+		api.GET("/homepage/bundle", articleHandler.GetHomepageBundle)
+		api.GET("/articles/trending", articleHandler.GetTrendingArticles)
 		api.GET("/articles/:slug", articleHandler.GetArticleBySlug)
 		api.GET("/articles/:slug/related", articleHandler.GetRelatedArticles)
+		api.GET("/categories/:slug/articles", articleHandler.GetLatestArticlesByCategory)
 		api.GET("/categories", articleHandler.GetCategories)
 		api.GET("/authors", articleHandler.GetAuthors)
 
