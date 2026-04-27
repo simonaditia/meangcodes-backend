@@ -38,7 +38,14 @@ func RegisterRoutes(router *gin.Engine, authConfig auth.Config, articleHandler *
 		admin := api.Group("")
 		admin.Use(middleware.AuthRequired(authConfig), middleware.RequireRole("admin"))
 		{
+			admin.GET("/buffers", articleHandler.GetBuffers)
+			admin.POST("/buffers", articleHandler.CreateBuffer)
+			admin.PATCH("/buffers/:id", articleHandler.UpdateBuffer)
+			admin.DELETE("/buffers/:id", articleHandler.DeleteBuffer)
+			admin.POST("/automation/run", articleHandler.RunAutomation)
+
 			admin.POST("/articles", articleHandler.CreateArticle)
+			admin.POST("/articles/repair-images", articleHandler.RepairArticleImages)
 			admin.PATCH("/articles/:slug", articleHandler.UpdateArticle)
 			admin.DELETE("/articles/:slug", articleHandler.DeleteArticle)
 			admin.POST("/uploads", uploadLimiter.Middleware(), articleHandler.UploadImage)

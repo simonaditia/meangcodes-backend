@@ -56,3 +56,16 @@ type UploadedImage struct {
 	UpdatedAt time.Time      `json:"updatedAt"`
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 }
+
+type ArticleBuffer struct {
+	ID         uint           `gorm:"primaryKey" json:"id"`
+	TitleHint  string         `gorm:"size:220" json:"titleHint,omitempty"`
+	Topic      string         `gorm:"size:240;not null" json:"topic"`
+	References string         `gorm:"type:text;not null;default:'[]'" json:"references"`
+	Priority   int            `gorm:"not null;default:100;index" json:"priority"`
+	Status     string         `gorm:"size:20;not null;default:queued;index" json:"status"`
+	Notes      string         `gorm:"type:text" json:"notes,omitempty"`
+	CreatedAt  time.Time      `gorm:"index" json:"createdAt"`
+	UpdatedAt  time.Time      `json:"updatedAt"`
+	DeletedAt  gorm.DeletedAt `gorm:"index" json:"-"`
+}

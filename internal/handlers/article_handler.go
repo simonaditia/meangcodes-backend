@@ -83,6 +83,15 @@ func (h *ArticleHandler) GetLatestArticles(c *gin.Context) {
 		query = query.Where("categories.slug = ?", strings.ToLower(categorySlug))
 	}
 
+	if search == "" && categorySlug == "" {
+		query = query.Order("CASE " +
+			"WHEN articles.slug = 'apa-itu-api-panduan-dasar-untuk-pemula' THEN 0 " +
+			"WHEN articles.slug LIKE 'apa-itu-rest-api%' THEN 1 " +
+			"WHEN articles.slug LIKE 'apa-itu-restful-api%' THEN 2 " +
+			"WHEN articles.slug = 'perbedaan-rest-api-dan-restful-api-panduan-praktis' THEN 3 " +
+			"ELSE 10 END")
+	}
+
 	var totalItems int64
 	if err := query.Count(&totalItems).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to count articles"})
@@ -295,6 +304,15 @@ func (h *ArticleHandler) GetHomepageBundle(c *gin.Context) {
 
 	if categorySlug != "" {
 		baseQuery = baseQuery.Where("categories.slug = ?", strings.ToLower(categorySlug))
+	}
+
+	if search == "" && categorySlug == "" {
+		baseQuery = baseQuery.Order("CASE " +
+			"WHEN articles.slug = 'apa-itu-api-panduan-dasar-untuk-pemula' THEN 0 " +
+			"WHEN articles.slug LIKE 'apa-itu-rest-api%' THEN 1 " +
+			"WHEN articles.slug LIKE 'apa-itu-restful-api%' THEN 2 " +
+			"WHEN articles.slug = 'perbedaan-rest-api-dan-restful-api-panduan-praktis' THEN 3 " +
+			"ELSE 10 END")
 	}
 
 	var totalItems int64

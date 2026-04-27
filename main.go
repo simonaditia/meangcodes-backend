@@ -35,7 +35,7 @@ func main() {
 		log.Fatalf("failed to connect Gorm DB: %v", err)
 	}
 
-	if err := database.AutoMigrate(gormDB, &models.User{}, &models.Category{}, &models.Article{}, &models.UploadedImage{}); err != nil {
+	if err := database.AutoMigrate(gormDB, &models.User{}, &models.Category{}, &models.Article{}, &models.UploadedImage{}, &models.ArticleBuffer{}); err != nil {
 		log.Fatalf("failed to run database migration: %v", err)
 	}
 
