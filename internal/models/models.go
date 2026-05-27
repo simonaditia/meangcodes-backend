@@ -1,8 +1,10 @@
 package models
 
-import "time"
+import (
+	"time"
 
-import "gorm.io/gorm"
+	"gorm.io/gorm"
+)
 
 type User struct {
 	ID           uint           `gorm:"primaryKey" json:"id"`
@@ -34,7 +36,7 @@ type Article struct {
 	Title      string         `gorm:"size:180;not null" json:"title"`
 	Slug       string         `gorm:"size:200;uniqueIndex;not null" json:"slug"`
 	Content    string         `gorm:"type:text;not null" json:"content"`
-	Thumbnail  string         `gorm:"size:255" json:"thumbnail,omitempty"`
+	Thumbnail  string         `gorm:"type:text" json:"thumbnail,omitempty"`
 	ReadTime   int            `gorm:"not null" json:"readTime"`
 	Views      int64          `gorm:"default:0;index;not null" json:"views"`
 	Published  bool           `gorm:"default:true;index;not null" json:"published"`
@@ -68,4 +70,16 @@ type ArticleBuffer struct {
 	CreatedAt  time.Time      `gorm:"index" json:"createdAt"`
 	UpdatedAt  time.Time      `json:"updatedAt"`
 	DeletedAt  gorm.DeletedAt `gorm:"index" json:"-"`
+}
+
+type AutomationTopicHistory struct {
+	ID            uint           `gorm:"primaryKey" json:"id"`
+	ArticleID     uint           `gorm:"uniqueIndex;not null" json:"articleId"`
+	ArticleTitle  string         `gorm:"size:180;not null" json:"articleTitle"`
+	SelectedTopic string         `gorm:"size:240;not null" json:"selectedTopic"`
+	CategoryName  string         `gorm:"size:80;not null" json:"categoryName"`
+	TopicKey      string         `gorm:"size:240;index;not null" json:"topicKey"`
+	CreatedAt     time.Time      `gorm:"index" json:"createdAt"`
+	UpdatedAt     time.Time      `json:"updatedAt"`
+	DeletedAt     gorm.DeletedAt `gorm:"index" json:"-"`
 }

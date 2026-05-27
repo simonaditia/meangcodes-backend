@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -44,6 +44,12 @@ type generatedReference struct {
 	CredibilityScore int    `json:"credibility_score,omitempty"`
 }
 
+type recentTopicContext struct {
+	Title    string
+	Category string
+	Key      string
+}
+
 type generatedArticleDraft struct {
 	Mode            string               `json:"mode"`
 	SelectedTopic   string               `json:"selected_topic"`
@@ -70,6 +76,12 @@ type openRouterResponse struct {
 type repairArticleImagesRequest struct {
 	Limit  int  `json:"limit"`
 	DryRun bool `json:"dryRun"`
+}
+
+type automationRunRequest struct {
+	PreferredTopics []string `json:"preferredTopics"`
+	BlockedTopics   []string `json:"blockedTopics"`
+	MaxRepeatCount  int      `json:"maxRepeatCount"`
 }
 
 func (h *ArticleHandler) GetBuffers(c *gin.Context) {
@@ -234,11 +246,23 @@ func (h *ArticleHandler) DeleteBuffer(c *gin.Context) {
 }
 
 func (h *ArticleHandler) RunAutomation(c *gin.Context) {
+	var req automationRunRequest
+	_ = c.ShouldBindJSON(&req)
+
 	mode := "auto"
 	var bufferItem *models.ArticleBuffer
 	topic := ""
 	titleHint := ""
 	references := []string{}
+	preferredTopics := sanitizeTopicList(req.PreferredTopics)
+	blockedTopics := sanitizeTopicList(req.BlockedTopics)
+	maxRepeatCount := req.MaxRepeatCount
+	if maxRepeatCount <= 0 {
+		maxRepeatCount = 2
+	}
+	if maxRepeatCount > 5 {
+		maxRepeatCount = 5
+	}
 
 	var queued models.ArticleBuffer
 	err := h.DB.Where("status = ?", "queued").Order("priority ASC").Order("created_at ASC").First(&queued).Error
@@ -253,8 +277,14 @@ func (h *ArticleHandler) RunAutomation(c *gin.Context) {
 		return
 	}
 
+	recentTopics, recentTopicErr := h.loadRecentTopicContext(10)
+	if recentTopicErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": recentTopicErr.Error()})
+		return
+	}
+
 	promptTemplate := loadAutomationPromptTemplate()
-	draft, draftErr := h.generateArticleDraft(mode, topic, titleHint, references, promptTemplate)
+	draft, draftErr := h.generateArticleDraft(mode, topic, titleHint, references, promptTemplate, recentTopics, preferredTopics, blockedTopics, maxRepeatCount)
 	if draftErr != nil {
 		if bufferItem != nil {
 			_ = h.DB.Model(bufferItem).Updates(map[string]any{
@@ -317,15 +347,28 @@ func (h *ArticleHandler) RunAutomation(c *gin.Context) {
 		if bufferItem != nil {
 			_ = h.DB.Model(bufferItem).Updates(map[string]any{
 				"status": "failed",
-				"notes":  "failed to create generated article",
+				"notes":  "failed to create generated article: " + err.Error(),
 			}).Error
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create generated article"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create generated article: " + err.Error()})
 		return
 	}
 
 	if err := h.DB.Preload("Author").Preload("Category").First(&article, article.ID).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "article generated but failed to load relation data"})
+		return
+	}
+
+	selectedTopic := firstNonEmpty(draft.SelectedTopic, title)
+	topicHistory := models.AutomationTopicHistory{
+		ArticleID:     article.ID,
+		ArticleTitle:  article.Title,
+		SelectedTopic: selectedTopic,
+		CategoryName:  article.Category.Name,
+		TopicKey:      normalizeAutomationTopicKey(selectedTopic, article.Category.Name),
+	}
+	if err := h.DB.Create(&topicHistory).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "article generated but failed to record topic history"})
 		return
 	}
 
@@ -346,10 +389,10 @@ func (h *ArticleHandler) RunAutomation(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"data": gin.H{
-			"mode":           mode,
-			"selectedTopic":  firstNonEmpty(draft.SelectedTopic, topic),
-			"references":     draft.References,
-			"article":        article,
+			"mode":            mode,
+			"selectedTopic":   firstNonEmpty(draft.SelectedTopic, topic),
+			"references":      draft.References,
+			"article":         article,
 			"bufferProcessed": bufferItem != nil,
 		},
 	})
@@ -392,10 +435,10 @@ func (h *ArticleHandler) RepairArticleImages(c *gin.Context) {
 
 		touched++
 		items = append(items, gin.H{
-			"id":             article.ID,
-			"slug":           article.Slug,
-			"thumbnailBefore": article.Thumbnail,
-			"thumbnailAfter":  newThumb,
+			"id":               article.ID,
+			"slug":             article.Slug,
+			"thumbnailBefore":  article.Thumbnail,
+			"thumbnailAfter":   newThumb,
 			"thumbnailChanged": thumbChanged,
 			"contentChanged":   contentChanged,
 		})
@@ -422,17 +465,17 @@ func (h *ArticleHandler) RepairArticleImages(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"data": gin.H{
-			"dryRun":        req.DryRun,
-			"processed":     len(articles),
-			"touched":       touched,
-			"repaired":      repaired,
-			"unchanged":     skipped,
-			"items":         items,
+			"dryRun":    req.DryRun,
+			"processed": len(articles),
+			"touched":   touched,
+			"repaired":  repaired,
+			"unchanged": skipped,
+			"items":     items,
 		},
 	})
 }
 
-func (h *ArticleHandler) generateArticleDraft(mode string, topic string, titleHint string, references []string, promptTemplate string) (*generatedArticleDraft, error) {
+func (h *ArticleHandler) generateArticleDraft(mode string, topic string, titleHint string, references []string, promptTemplate string, recentTopics []recentTopicContext, preferredTopics []string, blockedTopics []string, maxRepeatCount int) (*generatedArticleDraft, error) {
 	apiKey := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
 	if apiKey == "" {
 		return nil, errors.New("OPENROUTER_API_KEY is not configured")
@@ -449,9 +492,11 @@ func (h *ArticleHandler) generateArticleDraft(mode string, topic string, titleHi
 	}
 
 	systemPrompt := "You are an AI content orchestrator for Indonesian tech blog. Output JSON only. No markdown wrapper, no explanation outside JSON."
+	diversityPrompt := buildTopicDiversityPrompt(recentTopics, mode, topic, titleHint, references, preferredTopics, blockedTopics, maxRepeatCount)
 	userPrompt := fmt.Sprintf(
-		"Follow this policy and execute one run:\n\n%s\n\nExecution mode: %s\nTopic hint: %s\nTitle hint: %s\nReferences from manual buffer: %s\n\nReturn strict JSON with fields: mode, selected_topic, proposed_title, slug, meta_description, keywords, tags, references, trend_rationale, content_outline, article_markdown, thumbnail_url, quality_check.",
+		"Follow this policy and execute one run:\n\n%s\n\n%s\n\nExecution mode: %s\nTopic hint: %s\nTitle hint: %s\nReferences from manual buffer: %s\n\nReturn strict JSON with fields: mode, selected_topic, proposed_title, slug, meta_description, keywords, tags, references, trend_rationale, content_outline, article_markdown, thumbnail_url, quality_check.",
 		promptTemplate,
+		diversityPrompt,
 		mode,
 		topic,
 		titleHint,
@@ -518,7 +563,407 @@ func (h *ArticleHandler) generateArticleDraft(mode string, topic string, titleHi
 		}
 	}
 
+	if shouldRejectRecentTopic(draft, recentTopics, maxRepeatCount, blockedTopics) {
+		if retryDraft, retryErr := h.retryDraftWithTopicDiversity(mode, topic, titleHint, references, promptTemplate, recentTopics, preferredTopics, blockedTopics, maxRepeatCount); retryErr == nil {
+			draft = retryDraft
+		}
+	}
+
 	return draft, nil
+}
+
+func (h *ArticleHandler) retryDraftWithTopicDiversity(mode string, topic string, titleHint string, references []string, promptTemplate string, recentTopics []recentTopicContext, preferredTopics []string, blockedTopics []string, maxRepeatCount int) (*generatedArticleDraft, error) {
+	apiKey := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
+	if apiKey == "" {
+		return nil, errors.New("OPENROUTER_API_KEY is not configured")
+	}
+
+	model := strings.TrimSpace(os.Getenv("OPENROUTER_MODEL"))
+	if model == "" {
+		model = "openrouter/auto"
+	}
+
+	endpoint := strings.TrimSpace(os.Getenv("OPENROUTER_API_URL"))
+	if endpoint == "" {
+		endpoint = "https://openrouter.ai/api/v1/chat/completions"
+	}
+
+	systemPrompt := "You are an AI content orchestrator for Indonesian tech blog. Output JSON only. No markdown wrapper, no explanation outside JSON."
+	diversityPrompt := buildTopicDiversityPrompt(recentTopics, mode, topic, titleHint, references, preferredTopics, blockedTopics, maxRepeatCount)
+	userPrompt := fmt.Sprintf(
+		"The previous answer repeated a recent topic family. Regenerate with stronger topic diversity.\n\n%s\n\n%s\n\nExecution mode: %s\nTopic hint: %s\nTitle hint: %s\nReferences from manual buffer: %s\n\nReturn strict JSON with fields: mode, selected_topic, proposed_title, slug, meta_description, keywords, tags, references, trend_rationale, content_outline, article_markdown, thumbnail_url, quality_check.",
+		promptTemplate,
+		diversityPrompt,
+		mode,
+		topic,
+		titleHint,
+		strings.Join(references, ", "),
+	)
+
+	payload := map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": userPrompt},
+		},
+		"temperature":     0.8,
+		"response_format": map[string]string{"type": "json_object"},
+	}
+
+	body, _ := json.Marshal(payload)
+	client := &http.Client{Timeout: 90 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, errors.New("failed to construct openrouter request")
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("HTTP-Referer", "http://localhost:5173")
+	req.Header.Set("X-Title", "meangcodes-auto-article")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, errors.New("failed to call openrouter")
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("openrouter request failed with status %d", resp.StatusCode)
+	}
+
+	var parsed openRouterResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return nil, errors.New("failed to parse openrouter response")
+	}
+	if len(parsed.Choices) == 0 {
+		return nil, errors.New("openrouter returned empty choices")
+	}
+
+	content := strings.TrimSpace(parsed.Choices[0].Message.Content)
+	draft, parseErr := parseGeneratedDraft(content)
+	if parseErr != nil {
+		return nil, parseErr
+	}
+
+	draft.ProposedTitle = strings.TrimSpace(draft.ProposedTitle)
+	draft.SelectedTopic = strings.TrimSpace(draft.SelectedTopic)
+	draft.ArticleMarkdown = strings.TrimSpace(draft.ArticleMarkdown)
+	if draft.ArticleMarkdown == "" {
+		return nil, errors.New("generated article markdown is empty")
+	}
+
+	if len(draft.References) == 0 {
+		for _, ref := range references {
+			draft.References = append(draft.References, generatedReference{URL: ref, Reason: "manual buffer reference", CredibilityScore: 8})
+		}
+	}
+
+	return draft, nil
+}
+
+func buildTopicDiversityPrompt(recentTopics []recentTopicContext, mode string, topic string, titleHint string, references []string, preferredTopics []string, blockedTopics []string, maxRepeatCount int) string {
+	lines := []string{
+		"Topic diversity rule:",
+		fmt.Sprintf("- In auto mode, do not reuse any topic family that already appears %d or more times in the recent published history.", maxRepeatCount),
+		"- Prefer a clearly different subject from the recent published history.",
+		"- If recent history already repeats a family like serverless, choose another technology family and do not select another serverless angle.",
+		"- Keep the article varied across the site: cloud, backend, frontend, security, AI tools, databases, testing, performance, DevOps, developer productivity.",
+	}
+
+	if len(preferredTopics) > 0 {
+		lines = append(lines, "Preferred topic families to prioritize when picking a fresh angle:")
+		for _, item := range preferredTopics {
+			lines = append(lines, "- "+item)
+		}
+	}
+
+	if len(blockedTopics) > 0 {
+		lines = append(lines, "Blocked topic families to avoid unless the user explicitly requested them:")
+		for _, item := range blockedTopics {
+			lines = append(lines, "- "+item)
+		}
+	}
+
+	if mode == "auto" && strings.TrimSpace(topic) == "" && strings.TrimSpace(titleHint) == "" && len(references) == 0 {
+		lines = append(lines, "- AUTO mode is active because no manual inputs were provided. You must choose a fresh topic family that is not a near-duplicate of recent topics.")
+	}
+
+	if len(recentTopics) > 0 {
+		lines = append(lines, "Recent published topic history (newest first):")
+		for index, item := range recentTopics {
+			lines = append(lines, fmt.Sprintf("%d. %s | category: %s | key: %s", index+1, item.Title, item.Category, item.Key))
+		}
+
+		excluded := repeatedRecentTopicKeys(recentTopics, maxRepeatCount)
+		if len(excluded) > 0 {
+			lines = append(lines, "Excluded topic families because they repeat too often in recent history:")
+			for _, key := range excluded {
+				lines = append(lines, "- "+key)
+			}
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func shouldRejectRecentTopic(draft *generatedArticleDraft, recentTopics []recentTopicContext, maxRepeatCount int, blockedTopics []string) bool {
+	if draft == nil || len(recentTopics) == 0 {
+		return false
+	}
+
+	draftKey := automationTopicFamilySignature(firstNonEmpty(draft.SelectedTopic, draft.ProposedTitle), "")
+	if draftKey == "" {
+		return false
+	}
+
+	for _, blocked := range blockedTopics {
+		if draftKey == automationTopicFamilySignature(blocked, "") {
+			return true
+		}
+	}
+
+	for _, key := range repeatedRecentTopicKeys(recentTopics, maxRepeatCount) {
+		if key == draftKey {
+			return true
+		}
+	}
+
+	return false
+}
+
+func repeatedRecentTopicKeys(recentTopics []recentTopicContext, maxRepeatCount int) []string {
+	if maxRepeatCount <= 1 {
+		maxRepeatCount = 2
+	}
+
+	counts := map[string]int{}
+	order := []string{}
+	for _, item := range recentTopics {
+		key := strings.TrimSpace(item.Key)
+		if key == "" {
+			continue
+		}
+		if _, ok := counts[key]; !ok {
+			order = append(order, key)
+		}
+		counts[key]++
+	}
+
+	repeated := make([]string, 0)
+	for _, key := range order {
+		if counts[key] >= maxRepeatCount {
+			repeated = append(repeated, key)
+		}
+	}
+
+	return repeated
+}
+
+func (h *ArticleHandler) loadRecentTopicContext(limit int) ([]recentTopicContext, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+
+	var histories []models.AutomationTopicHistory
+	if err := h.DB.Order("created_at DESC").Limit(limit).Find(&histories).Error; err == nil && len(histories) > 0 {
+		contexts := make([]recentTopicContext, 0, len(histories))
+		for _, history := range histories {
+			title := strings.TrimSpace(history.ArticleTitle)
+			category := strings.TrimSpace(history.CategoryName)
+			key := automationTopicFamilySignature(firstNonEmpty(history.SelectedTopic, title), category)
+			if key == "" {
+				continue
+			}
+
+			contexts = append(contexts, recentTopicContext{
+				Title:    title,
+				Category: category,
+				Key:      key,
+			})
+		}
+
+		if len(contexts) > 0 {
+			return contexts, nil
+		}
+	}
+
+	var articles []models.Article
+	if err := h.DB.Preload("Category").Where("published = ?", true).Order("created_at DESC").Limit(limit).Find(&articles).Error; err != nil {
+		return nil, errors.New("failed to load recent article history")
+	}
+
+	contexts := make([]recentTopicContext, 0, len(articles))
+	for _, article := range articles {
+		title := strings.TrimSpace(article.Title)
+		category := strings.TrimSpace(article.Category.Name)
+		key := automationTopicFamilySignature(title, category)
+		if key == "" {
+			continue
+		}
+
+		contexts = append(contexts, recentTopicContext{
+			Title:    title,
+			Category: category,
+			Key:      key,
+		})
+	}
+
+	return contexts, nil
+}
+
+func sanitizeTopicList(values []string) []string {
+	clean := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		key := automationTopicFamilySignature(value, "")
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		clean = append(clean, value)
+	}
+
+	return clean
+}
+
+func automationTopicFamilySignature(title string, category string) string {
+	combined := strings.ToLower(strings.TrimSpace(category + " " + title))
+	combined = strings.NewReplacer(
+		"/", " ",
+		"|", " ",
+		"-", " ",
+		"_", " ",
+		":", " ",
+		",", " ",
+		".", " ",
+		"!", " ",
+		"?", " ",
+		"(", " ",
+		")", " ",
+	).Replace(combined)
+
+	parts := strings.Fields(combined)
+	families := []string{}
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		family := automationTopicFamilyToken(part)
+		if family == "" {
+			continue
+		}
+		if _, ok := seen[family]; ok {
+			continue
+		}
+		seen[family] = struct{}{}
+		families = append(families, family)
+	}
+
+	if len(families) == 0 {
+		return normalizeAutomationTopicKey(title, category)
+	}
+
+	return strings.Join(families, " ")
+}
+
+func automationTopicFamilyToken(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return ""
+	}
+
+	familyAliases := map[string]string{
+		"serverless":       "serverless",
+		"lambda":           "serverless",
+		"faas":             "serverless",
+		"functions":        "serverless",
+		"function":         "serverless",
+		"container":        "containers",
+		"containers":       "containers",
+		"containerization": "containers",
+		"docker":           "containers",
+		"kubernetes":       "containers",
+		"k8s":              "containers",
+		"cloud":            "cloud",
+		"cloud-native":     "cloud",
+		"cloudnative":      "cloud",
+		"backend":          "backend",
+		"frontend":         "frontend",
+		"security":         "security",
+		"ai":               "ai",
+		"database":         "database",
+		"databases":        "database",
+		"performance":      "performance",
+		"devops":           "devops",
+		"testing":          "testing",
+		"productivity":     "productivity",
+	}
+
+	if family, ok := familyAliases[value]; ok {
+		return family
+	}
+
+	for token, family := range familyAliases {
+		if strings.Contains(value, token) {
+			return family
+		}
+	}
+
+	return value
+}
+
+func normalizeAutomationTopicKey(title string, category string) string {
+	combined := strings.ToLower(strings.TrimSpace(category + " " + title))
+	combined = strings.NewReplacer(
+		"/", " ",
+		"|", " ",
+		"-", " ",
+		"_", " ",
+		":", " ",
+		",", " ",
+		".", " ",
+		"!", " ",
+		"?", " ",
+	).Replace(combined)
+
+	stopwords := map[string]struct{}{
+		"a": {}, "an": {}, "and": {}, "atau": {}, "dalam": {}, "the": {}, "to": {}, "of": {}, "for": {},
+		"cara": {}, "tips": {}, "panduan": {}, "mengapa": {}, "apa": {}, "untuk": {}, "dengan": {}, "pada": {},
+		"andalan": {}, "terbaik": {}, "update": {}, "guide": {}, "tutorial": {}, "build": {}, "membangun": {},
+	}
+
+	parts := strings.Fields(combined)
+	filtered := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, ok := stopwords[part]; ok {
+			continue
+		}
+		if len(part) < 3 {
+			continue
+		}
+		if _, ok := seen[part]; ok {
+			continue
+		}
+		seen[part] = struct{}{}
+		filtered = append(filtered, part)
+		if len(filtered) >= 5 {
+			break
+		}
+	}
+
+	return strings.Join(filtered, " ")
 }
 
 func parseGeneratedDraft(content string) (*generatedArticleDraft, error) {
@@ -766,7 +1211,7 @@ func normalizeMarkdownImageURLs(content string, topic string, title string) stri
 
 		alt := strings.TrimSpace(parts[1])
 		src := strings.TrimSpace(parts[2])
-		if isValidHTTPURL(src) && isReachableImageURL(src) {
+		if isValidHTTPURL(src) && !isKnownIrrelevantImageURL(src) && isReachableImageURL(src) {
 			return match
 		}
 
@@ -782,7 +1227,7 @@ func normalizeMarkdownImageURLs(content string, topic string, title string) stri
 
 func resolveThumbnailURL(raw string, topic string, title string) string {
 	value := strings.TrimSpace(raw)
-	if isValidHTTPURL(value) && isReachableImageURL(value) {
+	if isValidHTTPURL(value) && !isKnownIrrelevantImageURL(value) && isReachableImageURL(value) {
 		return value
 	}
 
@@ -790,31 +1235,7 @@ func resolveThumbnailURL(raw string, topic string, title string) string {
 }
 
 func buildRelevantImageURL(topic string, title string, hint string, index int, width int, height int) string {
-	keywords := buildImageKeywords(hint, topic, title)
-	if len(keywords) == 0 {
-		keywords = []string{"technology"}
-	}
-
-	keywordPath := strings.Join(keywords, ",")
-	if keywordPath == "" {
-		keywordPath = "technology"
-	}
-
-	if index > 0 {
-		keywordPath = fmt.Sprintf("%s,%d", keywordPath, index)
-	}
-
-	candidates := []string{
-		fmt.Sprintf("https://loremflickr.com/%d/%d/%s", width, height, keywordPath),
-	}
-
-	for _, candidate := range candidates {
-		if isValidHTTPURL(candidate) && isReachableImageURL(candidate) {
-			return candidate
-		}
-	}
-
-	return buildFallbackImageURL(topic, title, index, width, height)
+	return buildGeneratedTopicIllustrationURL(topic, title, hint, index, width, height)
 }
 
 func buildImageKeywords(values ...string) []string {
@@ -856,6 +1277,40 @@ func buildFallbackImageURL(topic string, title string, index int, width int, hei
 	}
 
 	return fmt.Sprintf("https://picsum.photos/seed/%s/%d/%d", seed, width, height)
+}
+
+func buildGeneratedTopicIllustrationURL(topic string, title string, hint string, index int, width int, height int) string {
+	mainTitle := strings.TrimSpace(firstNonEmpty(title, topic, "Artikel Teknologi"))
+	subtitle := strings.TrimSpace(firstNonEmpty(topic, hint, "Automasi Konten"))
+	if index > 0 {
+		subtitle = fmt.Sprintf("%s • Visual %d", subtitle, index)
+	}
+
+	if len(mainTitle) > 76 {
+		mainTitle = mainTitle[:76] + "..."
+	}
+	if len(subtitle) > 96 {
+		subtitle = subtitle[:96] + "..."
+	}
+
+	mainTitle = sanitizeSVGText(mainTitle)
+	subtitle = sanitizeSVGText(subtitle)
+
+	svg := fmt.Sprintf(`<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" role="img" aria-label="%s"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%%" stop-color="#0f172a"/><stop offset="100%%" stop-color="#155e75"/></linearGradient></defs><rect width="100%%" height="100%%" fill="url(#bg)"/><rect x="40" y="40" width="%d" height="%d" rx="22" fill="rgba(15,23,42,0.50)" stroke="rgba(255,255,255,0.18)"/><text x="72" y="130" fill="#c7d2fe" font-family="Manrope,Segoe UI,sans-serif" font-size="28" font-weight="700">MEANGCODES</text><text x="72" y="188" fill="#ffffff" font-family="Manrope,Segoe UI,sans-serif" font-size="44" font-weight="800">%s</text><text x="72" y="246" fill="#bae6fd" font-family="Manrope,Segoe UI,sans-serif" font-size="26">%s</text></svg>`, width, height, width, height, mainTitle, width-80, height-80, mainTitle, subtitle)
+
+	return "data:image/svg+xml;utf8," + url.QueryEscape(svg)
+}
+
+func sanitizeSVGText(value string) string {
+	replacer := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		`"`, "&quot;",
+		"'", "&#39;",
+	)
+
+	return replacer.Replace(strings.TrimSpace(value))
 }
 
 func isValidHTTPURL(raw string) bool {
@@ -914,6 +1369,27 @@ func isDisallowedImageHost(host string) bool {
 	return false
 }
 
+func isKnownIrrelevantImageURL(raw string) bool {
+	probe := strings.ToLower(strings.TrimSpace(raw))
+	if probe == "" {
+		return false
+	}
+
+	blockedPatterns := []string{
+		"loremflickr.com/cache/resized/defaultimage",
+		"defaultimage.small",
+		"defaultimage_",
+	}
+
+	for _, pattern := range blockedPatterns {
+		if strings.Contains(probe, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func isReachableImageURL(raw string) bool {
 	client := &http.Client{Timeout: 8 * time.Second}
 
@@ -921,6 +1397,11 @@ func isReachableImageURL(raw string) bool {
 	if err == nil {
 		if response, headErr := client.Do(requestHead); headErr == nil {
 			defer response.Body.Close()
+			if response.Request != nil && response.Request.URL != nil {
+				if isKnownIrrelevantImageURL(response.Request.URL.String()) {
+					return false
+				}
+			}
 			if response.StatusCode >= 200 && response.StatusCode < 400 {
 				contentType := strings.ToLower(strings.TrimSpace(response.Header.Get("Content-Type")))
 				if strings.HasPrefix(contentType, "image/") {
@@ -944,6 +1425,11 @@ func isReachableImageURL(raw string) bool {
 		return false
 	}
 	defer response.Body.Close()
+	if response.Request != nil && response.Request.URL != nil {
+		if isKnownIrrelevantImageURL(response.Request.URL.String()) {
+			return false
+		}
+	}
 
 	if response.StatusCode < 200 || response.StatusCode >= 400 {
 		return false
