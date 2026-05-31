@@ -19,6 +19,24 @@ import (
 	"github.com/joho/godotenv"
 )
 
+func loadAllowedOrigins() []string {
+	raw := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	origins := make([]string, 0, len(parts))
+	for _, part := range parts {
+		origin := strings.TrimSpace(part)
+		if origin != "" {
+			origins = append(origins, origin)
+		}
+	}
+
+	return origins
+}
+
 func main() {
 	_ = godotenv.Load()
 
@@ -67,9 +85,19 @@ func main() {
 	}
 
 	router := gin.Default()
+	allowedOrigins := loadAllowedOrigins()
+	if len(allowedOrigins) == 0 {
+		log.Fatal("CORS_ALLOWED_ORIGINS is required")
+	}
+
 	router.Use(cors.New(cors.Config{
 		AllowOriginFunc: func(origin string) bool {
-			return strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:")
+			for _, allowedOrigin := range allowedOrigins {
+				if origin == allowedOrigin {
+					return true
+				}
+			}
+			return false
 		},
 		AllowMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders: []string{"Origin", "Content-Type", "Accept", "Authorization"},
